@@ -54,7 +54,7 @@ func (c *Client) GetMe() (*User, error) {
 	httpClient := client.NewClientWithOptions(client.Options{Timeout: defaultClientTimeout})
 	response, err := httpClient.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("telegram: unable to send request: %v", err)
+		return nil, fmt.Errorf("telegram: unable to send request: %w", err)
 	}
 	defer response.Body.Close()
 
@@ -94,7 +94,7 @@ func (c *Client) SendMessage(message *MessageRequest) (*Message, error) {
 	httpClient := client.NewClientWithOptions(client.Options{Timeout: defaultClientTimeout})
 	response, err := httpClient.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("telegram: unable to send request: %v", err)
+		return nil, fmt.Errorf("telegram: unable to send request: %w", err)
 	}
 	defer response.Body.Close()
 

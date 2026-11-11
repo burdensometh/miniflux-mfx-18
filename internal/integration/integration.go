@@ -4,7 +4,10 @@
 package integration // import "miniflux.app/v2/internal/integration"
 
 import (
+	"context"
+	"errors"
 	"log/slog"
+	"net"
 
 	"miniflux.app/v2/internal/integration/apprise"
 	"miniflux.app/v2/internal/integration/archiveorg"
@@ -581,13 +584,14 @@ func PushEntries(feed *model.Feed, entries model.Entries, userIntegrations *mode
 		}
 	}
 
-	// Integrations that only support sending individual entries: the whole batch
-	// is delivered as one unit.
-	var batchErr error
-
+	// Integrations that only support sending individual entries are delivered
+	// one by one. An entry is never sent twice: only entries that failed with
+	// a definitive error are retried once, while entries whose delivery
+	// outcome is uncertain (e.g. the request timed out and may have reached
+	// the server) are not resent.
 	if userIntegrations.TelegramBotEnabled {
-		for _, entry := range entries {
-			if err := telegrambot.PushEntry(
+		deliverEntriesIndividually(entries, func(entry *model.Entry) error {
+			return telegrambot.PushEntry(
 				feed,
 				entry,
 				userIntegrations.TelegramBotToken,
@@ -596,11 +600,8 @@ func PushEntries(feed *model.Feed, entries model.Entries, userIntegrations *mode
 				userIntegrations.TelegramBotDisableWebPagePreview,
 				userIntegrations.TelegramBotDisableNotification,
 				userIntegrations.TelegramBotDisableButtons,
-			); err != nil {
-				batchErr = err
-				break
-			}
-		}
+			)
+		})
 	}
 
 	if userIntegrations.ReadeckPushEnabled {
@@ -610,47 +611,60 @@ func PushEntries(feed *model.Feed, entries model.Entries, userIntegrations *mode
 			userIntegrations.ReadeckLabels,
 			userIntegrations.ReadeckOnlyURL,
 		)
-		for _, entry := range entries {
-			if err := readeckClient.CreateBookmark(entry.URL, entry.Title, entry.Content); err != nil {
-				batchErr = err
-				break
-			}
-		}
+		deliverEntriesIndividually(entries, func(entry *model.Entry) error {
+			return readeckClient.CreateBookmark(entry.URL, entry.Title, entry.Content)
+		})
 	}
+}
 
-	if batchErr != nil {
-		slog.Warn("Retrying the whole batch after a delivery failure",
-			slog.Int64("user_id", userIntegrations.UserID),
-			slog.Int("nb_entries", len(entries)),
-			slog.Int64("feed_id", feed.ID),
-			slog.Any("error", batchErr),
-		)
+// deliverEntriesIndividually pushes entries one at a time and retries only
+// the entries that failed with a definitive error. Successfully delivered
+// entries are never resent, and neither are entries whose delivery outcome
+// is uncertain (e.g. the request timed out and may have been processed by
+// the server), otherwise users would receive duplicate notifications.
+func deliverEntriesIndividually(entries model.Entries, pushFn func(*model.Entry) error) {
+	var failedEntries model.Entries
 
-		if userIntegrations.TelegramBotEnabled {
-			for _, entry := range entries {
-				telegrambot.PushEntry(
-					feed,
-					entry,
-					userIntegrations.TelegramBotToken,
-					userIntegrations.TelegramBotChatID,
-					userIntegrations.TelegramBotTopicID,
-					userIntegrations.TelegramBotDisableWebPagePreview,
-					userIntegrations.TelegramBotDisableNotification,
-					userIntegrations.TelegramBotDisableButtons,
+	for _, entry := range entries {
+		if err := pushFn(entry); err != nil {
+			if isUncertainDeliveryError(err) {
+				slog.Warn("Delivery outcome is uncertain; the entry will not be resent to avoid a duplicate notification",
+					slog.Int64("entry_id", entry.ID),
+					slog.String("entry_url", entry.URL),
+					slog.Any("error", err),
 				)
+				continue
 			}
-		}
 
-		if userIntegrations.ReadeckPushEnabled {
-			readeckClient := readeck.NewClient(
-				userIntegrations.ReadeckURL,
-				userIntegrations.ReadeckAPIKey,
-				userIntegrations.ReadeckLabels,
-				userIntegrations.ReadeckOnlyURL,
+			slog.Warn("Unable to deliver entry; it will be retried once",
+				slog.Int64("entry_id", entry.ID),
+				slog.String("entry_url", entry.URL),
+				slog.Any("error", err),
 			)
-			for _, entry := range entries {
-				readeckClient.CreateBookmark(entry.URL, entry.Title, entry.Content)
-			}
+			failedEntries = append(failedEntries, entry)
 		}
 	}
+
+	for _, entry := range failedEntries {
+		if err := pushFn(entry); err != nil {
+			slog.Warn("Unable to deliver entry after retry",
+				slog.Int64("entry_id", entry.ID),
+				slog.String("entry_url", entry.URL),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
+
+// isUncertainDeliveryError returns true when the error leaves the delivery
+// outcome unknown, e.g. when the HTTP client timed out while waiting for a
+// response: the request may still have been processed by the server, so the
+// entry must not be resent.
+func isUncertainDeliveryError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }

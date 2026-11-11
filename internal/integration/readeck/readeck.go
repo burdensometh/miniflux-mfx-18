@@ -125,7 +125,7 @@ func (c *Client) CreateBookmark(entryURL, entryTitle string, entryContent string
 	httpClient := client.NewClientWithOptions(client.Options{Timeout: defaultClientTimeout, BlockPrivateNetworks: !config.Opts.IntegrationAllowPrivateNetworks()})
 	response, err := httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("readeck: unable to send request: %v", err)
+		return fmt.Errorf("readeck: unable to send request: %w", err)
 	}
 	defer response.Body.Close()
 
